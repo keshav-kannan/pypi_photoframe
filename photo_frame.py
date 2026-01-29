@@ -22,8 +22,8 @@ FAVORITES_DIR_NAME = "favorites"
 DEFAULT_PHOTOS_WINDOWS = r"C:\PhotoFrame\photos"
 DEFAULT_DATA_WINDOWS   = r"C:\PhotoFrame\data"
 
-DEFAULT_PHOTOS_LINUX = "/home/pi/photo_frame/photos"
-DEFAULT_DATA_LINUX   = "/home/pi/photo_frame/data"
+DEFAULT_PHOTOS_LINUX = "/home/admin/photo_frame/photos"
+DEFAULT_DATA_LINUX   = "/home/admin/photo_frame/data"
 
 
 
@@ -671,6 +671,31 @@ class ImageCache:
             self.surface = None
             return None
 
+    def load_for_display(self, path: str, target_size: tuple[int, int]) -> pygame.Surface | None:
+        key = (path, target_size)
+
+        if not hasattr(self, "_display_cache"):
+            self._display_cache = {}
+
+        cached = self._display_cache.get(key)
+        if cached is not None:
+            return cached
+
+        base = self.load(path)
+        if base is None:
+            return None
+
+        try:
+            surf = base
+            if surf.get_size() != target_size:
+                surf = pygame.transform.scale(surf, target_size)
+
+            self._display_cache[key] = surf
+            return surf
+        except Exception:
+            return None
+
+
 
 def blit_centered_scaled(screen: pygame.Surface, img: pygame.Surface) -> None:
     sw, sh = screen.get_size()
@@ -726,6 +751,23 @@ class PhotoFrameApp:
 
         self.last_touch_t = now_monotonic()
 
+        #caching
+        self._cached_img_path = None
+        self._cached_img_surf = None
+        self._cached_img_rect = None
+
+        # --- Caption render cache (performance) ---
+        self._cap_cache_path: str | None = None
+        self._cap_cache_max_w: int | None = None
+        self._cap_cache_overlay_h: int | None = None
+
+        self._cap_cache_surfs: list[pygame.Surface] = []
+        self._cap_cache_heights: list[int] = []
+
+        # --- Indicator cache ---
+        self._indicator_last_text: str | None = None
+        self._indicator_surf: pygame.Surface | None = None
+
         # Slide timing
         self.last_advance_t = now_monotonic()
 
@@ -733,6 +775,15 @@ class PhotoFrameApp:
         self.files: List[str] = []
         self.files_sig = (0, 0)
         self.last_rescan_t = 0.0
+
+                # --- Overlay bar cache ---
+        self._overlay_bar_surf: pygame.Surface | None = None
+        self._overlay_bar_size: tuple[int, int] | None = None
+
+        # --- Button label cache ---
+        self._button_label_cache: dict[str, pygame.Surface] = {}
+        self._button_label_font_size: int | None = None
+
 
         # Input gesture tracking
         self.pointer_down = False
@@ -760,6 +811,8 @@ class PhotoFrameApp:
     def init_pygame(self) -> None:
         pygame.init()
         pygame.font.init()
+        if hasattr(self.cache, "_display_cache"):
+            self.cache._display_cache.clear()
 
         flags = pygame.SCALED
         if self.cfg.fullscreen:
@@ -777,6 +830,94 @@ class PhotoFrameApp:
 
 
         pygame.mouse.set_visible(False)
+
+    def rebuild_captions_cache(self, image_path: str) -> None:
+        assert self.screen
+
+        cap, fld = self.get_captions_for(image_path)
+
+        sw, sh = self.screen.get_size()
+        max_w = int(sw * self.cfg.caption_max_width_ratio)
+
+        overlay_h = (self.cfg.button_height + self.cfg.ui_padding * 2) if self.overlay_visible else 0
+
+        # Build at full opacity (255) ONCE
+        caption_surfs: list[pygame.Surface] = []
+        folder_surfs: list[pygame.Surface] = []
+
+        if cap:
+            caption_surfs, _ = build_wrapped_surfaces(
+                cap,
+                base_size=self.cfg.caption_base_size,
+                min_size=self.cfg.caption_min_size,
+                max_width=max_w,
+                max_lines=self.cfg.caption_max_lines,
+                uppercase=False,
+                alpha=255
+            )
+            folder_surfs, _ = build_wrapped_surfaces(
+                fld,
+                base_size=self.cfg.folder_base_size,
+                min_size=self.cfg.folder_min_size,
+                max_width=max_w,
+                max_lines=self.cfg.folder_max_lines,
+                uppercase=True,
+                alpha=255
+            )
+            lines = caption_surfs + folder_surfs
+        else:
+            folder_surfs, _ = build_wrapped_surfaces(
+                fld,
+                base_size=self.cfg.caption_base_size,
+                min_size=self.cfg.caption_min_size,
+                max_width=max_w,
+                max_lines=self.cfg.caption_max_lines,
+                uppercase=True,
+                alpha=255
+            )
+            lines = folder_surfs
+
+        self._cap_cache_path = image_path
+        self._cap_cache_max_w = max_w
+        self._cap_cache_overlay_h = overlay_h
+
+        self._cap_cache_surfs = lines
+        self._cap_cache_heights = [s.get_height() for s in lines]
+
+    def _get_button_text_surface(self, label: str) -> pygame.Surface:
+        # If font size changes, clear cache
+        if self._button_label_font_size != self.button_font_size:
+            self._button_label_cache.clear()
+            self._button_label_font_size = self.button_font_size
+
+        surf = self._button_label_cache.get(label)
+        if surf is not None:
+            return surf
+
+        font = load_font(self.button_font_size)
+        # Keep it alpha-safe; pygame font surfaces are fine
+        surf = font.render(label, True, (255, 255, 255))
+        self._button_label_cache[label] = surf
+        return surf
+
+    def get_current_image_surface(self, path: str):
+        if path == self._cached_img_path and self._cached_img_surf is not None:
+            return self._cached_img_surf
+
+        surf = pygame.image.load(path)
+        # convert to display format (much faster blits)
+        surf = surf.convert()
+
+        # If already 1920x1200, do NOT scale
+        sw, sh = self.screen.get_size()
+        if surf.get_width() != sw or surf.get_height() != sh:
+            # scale (fast) not smoothscale
+            surf = pygame.transform.scale(surf, (sw, sh))
+
+        self._cached_img_path = path
+        self._cached_img_surf = surf
+        return surf
+
 
     def action_toggle_interval(self) -> None:
         steps = list(self.cfg.interval_steps)
@@ -935,6 +1076,9 @@ class PhotoFrameApp:
         self.files = list_media_files(self.photos_dir)
         self.files_sig = file_signature(self.files)
 
+        if hasattr(self.cache, "_display_cache"):
+            self.cache._display_cache.clear()
+
         if self.order:
             self.order.set_files(self.files, current_path=current)
             # Fresh cycle: this is what allows repeats again immediately
@@ -1030,7 +1174,15 @@ class PhotoFrameApp:
         self.order.next()
         self.last_advance_t = now_monotonic()
         self.mark_caption_trigger()
+        if self.screen and self.captions_on:
+            cur = self.order.current()
+            if cur:
+                self.rebuild_captions_cache(cur)
+        # If you have a caption cache builder, call it here:
+        # self.rebuild_caption_cache(self.order.current())
+
         self.persist_state()
+
 
     def action_toggle_shuffle(self) -> None:
         if not self.order:
@@ -1145,8 +1297,25 @@ class PhotoFrameApp:
         if (t - self.last_advance_t) >= self.cfg.slide_seconds:
             self.order.next()
             self.mark_caption_trigger()
+            if self.screen and self.captions_on:
+                cur = self.order.current()
+                if cur:
+                    self.rebuild_captions_cache(cur)
+
+            # If you have a caption cache builder, call it here:
+            # self.rebuild_caption_cache(self.order.current())
+
             self.last_advance_t = t
             self.persist_state()
+
+    def _ensure_overlay_bar(self, sw: int, overlay_h: int) -> None:
+        size = (sw, overlay_h)
+        if self._overlay_bar_surf is None or self._overlay_bar_size != size:
+            bar = pygame.Surface(size, pygame.SRCALPHA)
+            bar.fill((0, 0, 0, 140))
+            self._overlay_bar_surf = bar
+            self._overlay_bar_size = size
+
 
     def draw_indicator(self) -> None:
         assert self.screen and self.font_small and self.order
@@ -1155,12 +1324,22 @@ class PhotoFrameApp:
         if a <= 0:
             return
 
-        pos = self.order.position_text()  # "1/13" (or shuffle bag position)
-        surf = self.font_small.render(pos, True, (255, 255, 255))
-        if a != 255:
-            surf.set_alpha(a)
+        pos = self.order.position_text()  # "1/13"
+        if pos != self._indicator_last_text or self._indicator_surf is None:
+            # render once
+            self._indicator_last_text = pos
+            # IMPORTANT: don't convert() this; keep alpha
+            self._indicator_surf = self.font_small.render(pos, True, (255, 255, 255))
+
+        surf = self._indicator_surf
+        if surf is None:
+            return
+
+        # Always set alpha (avoid set_alpha(None) issues)
+        surf.set_alpha(a)
 
         self.screen.blit(surf, (12, 12))
+
 
 
     def caption_alpha(self) -> int:
@@ -1201,80 +1380,88 @@ class PhotoFrameApp:
         assert self.screen and self.font
         sw, sh = self.screen.get_size()
 
-        # Dim bottom area slightly
         overlay_h = self.cfg.button_height + self.cfg.ui_padding * 2
-        bar = pygame.Surface((sw, overlay_h), pygame.SRCALPHA)
-        bar.fill((0, 0, 0, 140))
-        self.screen.blit(bar, (0, sh - overlay_h))
+
+        # Reuse bar surface (no per-frame allocation)
+        self._ensure_overlay_bar(sw, overlay_h)
+        if self._overlay_bar_surf is not None:
+            self.screen.blit(self._overlay_bar_surf, (0, sh - overlay_h))
 
         # Draw buttons
         for b in buttons:
             pygame.draw.rect(self.screen, (30, 30, 30), b.rect, border_radius=12)
             pygame.draw.rect(self.screen, (200, 200, 200), b.rect, width=2, border_radius=12)
 
+            # Dynamic labels
             label = b.label
-            # Show current pause/shuffle status in labels (tiny UX improvement)
             if b.action == "toggle_pause":
                 label = "Play" if self.paused else "Pause"
-            if b.action == "toggle_shuffle" and self.order:
+            elif b.action == "toggle_shuffle" and self.order:
                 label = "Shuffle: On" if self.order.shuffle else "Shuffle: Off"
-            if b.action == "toggle_captions":
+            elif b.action == "toggle_captions":
                 label = f"Captions: {self.caption_mode.upper()}"
-            if b.action == "toggle_interval":
+            elif b.action == "toggle_interval":
                 label = f"{int(self.cfg.slide_seconds)}s"
-            if b.action == "toggle_brightness":
+            elif b.action == "toggle_brightness":
                 pct = int(self.user_brightness * 100)
                 label = f"Bright: {pct}%"
 
-
-            pad = 10
-            font = load_font(self.button_font_size)
-
-            # ... compute label string as you already do ...
-
-            txt = font.render(label, True, (255, 255, 255))
+            txt = self._get_button_text_surface(label)
             tx = b.rect.centerx - txt.get_width() // 2
             ty = b.rect.centery - txt.get_height() // 2
             self.screen.blit(txt, (tx, ty))
 
 
 
+
     def draw_frame(self) -> None:
         assert self.screen and self.order
 
-        self.screen.fill((0, 0, 0))
-
         if self.sleeping:
             # Pure black screen
+            self.screen.fill((0, 0, 0))
             return
 
         current = self.order.current()
         if not current:
             # No images
+            self.screen.fill((0, 0, 0))
             assert self.font
             msg = self.font.render("No images found in folder.", True, (255, 255, 255))
             self.screen.blit(msg, (30, 30))
             return
 
-        img = self.cache.load(current)
+        # Load a display-ready (converted+scaled) surface ONCE per image
+        target_size = self.screen.get_size()
+        img = self.cache.load_for_display(current, target_size)
         if img is None:
-            # Could not load this file; skip it next tick
+            self.screen.fill((0, 0, 0))
             assert self.font
             msg = self.font.render("Failed to load image. Skipping…", True, (255, 200, 200))
             self.screen.blit(msg, (30, 30))
-            # Try advance quickly
+
+            # Skip it next tick (do minimal work in draw)
             self.order.next()
             self.last_advance_t = now_monotonic()
+            self.mark_caption_trigger()
             self.persist_state()
             return
 
-        blit_centered_scaled(self.screen, img)
+        # Full-screen blit (fast)
+        self.screen.blit(img, (0, 0))
+
         self.draw_dim_overlay()
         self.draw_clock()
-        # Always show small indicator (useful on a frame)
-        self.draw_indicator()
+
+        # If you want indicator tied to captions toggle, do this:
         if self.captions_on:
+            self.draw_indicator()
             self.draw_captions(current)
+        else:
+            # If you truly want indicator always, keep your old behavior:
+            # self.draw_indicator()
+            pass
+
 
     def draw_captions(self, image_path: str) -> None:
         assert self.screen
@@ -1283,61 +1470,30 @@ class PhotoFrameApp:
         if a <= 0:
             return
 
-        cap, fld = self.get_captions_for(image_path)
-
         sw, sh = self.screen.get_size()
         max_w = int(sw * self.cfg.caption_max_width_ratio)
+        overlay_h = (self.cfg.button_height + self.cfg.ui_padding * 2) if self.overlay_visible else 0
 
-        # Build surfaces for caption (as saved) and folder (ALL CAPS)
-        caption_surfs, caption_line_h = ([], 0)
-        folder_surfs, folder_line_h = ([], 0)
+        # Rebuild cache only when needed
+        if (
+            self._cap_cache_path != image_path
+            or self._cap_cache_max_w != max_w
+            or self._cap_cache_overlay_h != overlay_h
+        ):
+            self.rebuild_captions_cache(image_path)
 
-        if cap:
-            caption_surfs, caption_line_h = build_wrapped_surfaces(
-                cap,
-                base_size=self.cfg.caption_base_size,
-                min_size=self.cfg.caption_min_size,
-                max_width=max_w,
-                max_lines=self.cfg.caption_max_lines,
-                uppercase=False,
-                alpha=a
-            )
-            folder_surfs, folder_line_h = build_wrapped_surfaces(
-                fld,
-                base_size=self.cfg.folder_base_size,
-                min_size=self.cfg.folder_min_size,
-                max_width=max_w,
-                max_lines=self.cfg.folder_max_lines,
-                uppercase=True,
-                alpha=a
-            )
-            lines = caption_surfs + folder_surfs
-            heights = [s.get_height() for s in lines]
-        else:
-            # No sidecar caption -> folder only (ALL CAPS)
-            folder_surfs, folder_line_h = build_wrapped_surfaces(
-                fld,
-                base_size=self.cfg.caption_base_size,   # treat as main line
-                min_size=self.cfg.caption_min_size,
-                max_width=max_w,
-                max_lines=self.cfg.caption_max_lines,
-                uppercase=True,
-                alpha=a
-            )
-            lines = folder_surfs
-            heights = [s.get_height() for s in lines]
-
+        lines = self._cap_cache_surfs
+        heights = self._cap_cache_heights
         if not lines:
             return
 
-        # Place captions above overlay if overlay visible
-        overlay_h = (self.cfg.button_height + self.cfg.ui_padding * 2) if self.overlay_visible else 0
         bottom_margin = self.cfg.caption_margin_bottom + overlay_h
-
         total_h = sum(heights) + self.cfg.caption_line_gap * (len(lines) - 1)
         y = sh - bottom_margin - total_h - 8
 
+        # Apply alpha cheaply at blit-time
         for surf in lines:
+            surf.set_alpha(a)   # always set; never set_alpha(None)
             x = (sw - surf.get_width()) // 2
             self.screen.blit(surf, (x, y))
             y += surf.get_height() + self.cfg.caption_line_gap
@@ -1350,7 +1506,7 @@ class PhotoFrameApp:
         assert self.screen
 
         clock = pygame.time.Clock()
-
+        TARGET_FPS = 20  # good for Pi 1; try 20–30
         buttons, _ = make_buttons(*self.screen.get_size(), self.cfg)
 
 
@@ -1438,26 +1594,29 @@ class PhotoFrameApp:
         self.persist_state()
         pygame.quit()
 
-
-
-
-
-
 def main() -> None:
     args = parse_args()
 
-    # Defaults per OS
+    home = os.path.expanduser("~")
+
     if os.name == "nt":
         default_photos = r"C:\PhotoFrame\photos"
-        default_data = r"C:\PhotoFrame\data"
+        default_data = os.path.join(home, "PhotoFrameData")
     else:
-        default_photos = "/home/pi/photo_frame/photos"
-        default_data = "/home/pi/photo_frame/data"
+        default_photos = "/mnt/photo-frame/photos"
+        default_data = os.path.join(home, "photo-frame-data")
 
-    # Choose sources with priority:
-    # 1) CLI args, 2) ENV vars, 3) defaults
-    photos_dir = args.photos or os.environ.get("PHOTO_FRAME_PHOTOS_DIR") or default_photos
-    data_dir = args.data or os.environ.get("PHOTO_FRAME_DATA_DIR") or default_data
+
+    photos_dir = (
+        args.photos
+        or os.environ.get("PHOTO_FRAME_PHOTOS_DIR")
+        or default_photos
+    )
+    data_dir = (
+        args.data
+        or os.environ.get("PHOTO_FRAME_DATA_DIR")
+        or default_data
+    )
 
     os.makedirs(data_dir, exist_ok=True)
 
