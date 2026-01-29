@@ -1,0 +1,18 @@
+[Unit]
+Description=Photo Frame (Pygame)
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+EnvironmentFile=/home/pi/photo-frame-data/env
+WorkingDirectory=/home/pi/photo-frame
+# Ensure we have a DISPLAY for X11 (typical Pi desktop)
+Environment=DISPLAY=:0
+ExecStart=/home/pi/photo-frame/scripts/run_frame.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target

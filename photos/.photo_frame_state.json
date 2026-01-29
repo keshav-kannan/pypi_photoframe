@@ -1,0 +1,11 @@
+{
+  "shuffle": false,
+  "paused": true,
+  "sleeping": false,
+  "current_path": "C:\\Useful_Scripts\\pypi_photo_frame\\photos\\MLKSunrise.jpg",
+  "saved_at_epoch": 1769653593,
+  "captions_on": true,
+  "caption_mode": "on",
+  "slide_seconds": 3.0,
+  "user_brightness": 1.0
+}
