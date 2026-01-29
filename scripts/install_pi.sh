@@ -10,6 +10,8 @@ RCLONE_REMOTE="${RCLONE_REMOTE:-gdrive}"
 RCLONE_SOURCE="${RCLONE_SOURCE:-PhotoFrame}"   # folder name in Drive
 # --------------------------------
 
+chmod +x scripts/run_frame.sh || true
+
 echo "==> Installing OS packages..."
 sudo apt-get update
 sudo apt-get install -y \
