@@ -1,10 +1,6 @@
 [Unit]
-Description=Sync photos from Google Drive via rclone
-After=network-online.target
-Wants=network-online.target
+Description=Photo Frame Sync
 
 [Service]
 Type=oneshot
-User=pi
-EnvironmentFile=/home/pi/photo-frame-data/env
-ExecStart=/usr/bin/rclone sync "${RCLONE_REMOTE:-gdrive}:${RCLONE_SOURCE:-PhotoFrame}" "${PHOTO_FRAME_PHOTOS_DIR}" --create-empty-src-dirs --delete-excluded --fast-list --transfers 4 --checkers 8
+ExecStart=/usr/bin/rclone sync gdrive:PhotoFrame /mnt/photo-frame/photos --fast-list

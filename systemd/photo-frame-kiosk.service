@@ -1,0 +1,13 @@
+[Unit]
+Description=Photo Frame Kiosk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/xinit /home/pi/photo-frame/scripts/run_kiosk.sh -- :0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

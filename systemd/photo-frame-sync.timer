@@ -1,10 +1,9 @@
 [Unit]
-Description=Run photo sync every 10 minutes
+Description=Sync photos every 10 minutes
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=10min
-Persistent=true
+OnBootSec=3min
+OnUnitActiveSec=24h
 
 [Install]
 WantedBy=timers.target
