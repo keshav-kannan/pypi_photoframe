@@ -6,11 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=pi
-EnvironmentFile=/home/pi/photo-frame-data/env
-WorkingDirectory=/home/pi/photo-frame
+EnvironmentFile=/home/admin/photo-frame-data/env
+WorkingDirectory=/home/admin/photo-frame
 # Ensure we have a DISPLAY for X11 (typical Pi desktop)
 Environment=DISPLAY=:0
-ExecStart=/home/pi/photo-frame/scripts/run_frame.sh
+ExecStart=/home/admin/photo-frame/scripts/run_frame.sh
 Restart=on-failure
 RestartSec=2
 

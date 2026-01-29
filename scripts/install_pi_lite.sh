@@ -44,7 +44,7 @@ systemctl --user daemon-reload
 systemctl --user enable photo-frame-kiosk.service
 
 echo "=== Enable user services at boot ==="
-sudo loginctl enable-linger pi
+sudo loginctl enable-linger admin
 
 echo "=== DONE ==="
 echo "Next:"
