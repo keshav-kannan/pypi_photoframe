@@ -631,7 +631,9 @@ def make_buttons(screen_w: int, screen_h: int, cfg: Config) -> List[Button]:
 
     total_w = n * btn_w + total_gaps
     start_x = (screen_w - total_w) // 2
-    y = screen_h - cfg.ui_padding - cfg.button_height
+    overlay_h = cfg.button_height + cfg.ui_padding * 2
+    y = screen_h - overlay_h + cfg.ui_padding
+
 
     buttons: List[Button] = []
     x = start_x
@@ -640,7 +642,7 @@ def make_buttons(screen_w: int, screen_h: int, cfg: Config) -> List[Button]:
         buttons.append(Button(label=label, rect=rect, action=action))
         x += btn_w + cfg.button_gap
 
-    return buttons, [label for label, _ in labels_actions]
+    return buttons
 
 
 
@@ -749,6 +751,9 @@ class PhotoFrameApp:
         self.image_shown_t = now_monotonic()
         self.last_drawn_path = None
 
+        self.touch_start = None
+        self.touch_start_time = 0
+
         self.last_touch_t = now_monotonic()
 
         #caching
@@ -809,27 +814,60 @@ class PhotoFrameApp:
         self.persisted = load_state(self.state_path)
 
     def init_pygame(self) -> None:
+        if os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
         pygame.init()
+        if os.name == "nt":
+            pygame.mouse.set_visible(True)
+        else:
+            pygame.mouse.set_visible(False)  # kiosk
+
+
         pygame.font.init()
         if hasattr(self.cache, "_display_cache"):
             self.cache._display_cache.clear()
 
         flags = pygame.SCALED
-        if self.cfg.fullscreen:
-            flags |= pygame.FULLSCREEN
 
-        TARGET_W = 1920
-        TARGET_H = 1200
 
-        self.screen = pygame.display.set_mode((TARGET_W, TARGET_H), flags)
 
-        pygame.display.set_caption("Photo Frame")
+        TARGET_W, TARGET_H = 1920, 1200
+        self.logical_size = (TARGET_W, TARGET_H)
+
+        if os.name == "nt":
+            # Dev window (resizable), no SCALED
+            self.screen = pygame.display.set_mode((1920, 1200), pygame.RESIZABLE)
+            self.canvas = pygame.Surface(self.logical_size).convert()
+        else:
+            # Pi kiosk: true 1920x1200 fullscreen
+            flags = pygame.FULLSCREEN
+            self.screen = pygame.display.set_mode(self.logical_size, flags)
+            self.canvas = self.screen  # draw directly (no extra scaling cost)
+
+
+        # Force focus on Windows
+        if os.name == "nt":
+            pygame.event.pump()
+            pygame.display.flip()
+
 
         self.font = load_font(28)
         self.font_small = load_font(20)
+        pygame.mouse.set_visible(os.name == "nt")
+
+    def map_pointer_pos(self, pos: tuple[int, int]) -> tuple[int, int]:
+        if os.name != "nt":
+            return pos
+        wx, wy = self.screen.get_size()           # window size
+        lx, ly = self.logical_size                # 1920x1200
+        return (int(pos[0] * lx / wx), int(pos[1] * ly / wy))
 
 
-        pygame.mouse.set_visible(False)
 
     def rebuild_captions_cache(self, image_path: str) -> None:
         assert self.screen
@@ -918,6 +956,36 @@ class PhotoFrameApp:
         self._cached_img_surf = surf
         return surf
 
+    def on_touch_down(self, pos):
+        self.touch_start = pos
+        self.touch_start_time = time.monotonic()
+        self.wake_from_sleep()
+        self.show_overlay()
+
+    def on_touch_up(self, pos):
+        if not self.touch_start:
+            return
+
+        dx = pos[0] - self.touch_start[0]
+        dy = pos[1] - self.touch_start[1]
+        dt = time.monotonic() - self.touch_start_time
+
+        SWIPE_DIST = 80      # pixels
+        SWIPE_TIME = 0.6     # seconds
+
+        if abs(dx) > SWIPE_DIST and abs(dx) > abs(dy) and dt < SWIPE_TIME:
+            if dx > 0:
+                self.action_prev()
+            else:
+                self.action_next()
+        else:
+            # short tap
+            self.handle_tap(pos)
+
+        self.touch_start = None
+
+    def on_touch_drag(self, pos, rel):
+        pass  # optional, swipe handled on release
 
     def action_toggle_interval(self) -> None:
         steps = list(self.cfg.interval_steps)
@@ -1242,15 +1310,17 @@ class PhotoFrameApp:
         self.down_time = now_monotonic()
         self.moved = False
 
-    def handle_pointer_motion(self, pos: Tuple[int, int]) -> None:
+    def handle_pointer_motion(self, pos: Tuple[int, int], rel=(0, 0)) -> None:
         if not self.pointer_down:
             return
         dx = pos[0] - self.down_pos[0]
         dy = pos[1] - self.down_pos[1]
-        if abs(dx) > 10 or abs(dy) > 10:
+        if abs(dx) > 3 or abs(dy) > 3:
             self.moved = True
 
+
     def handle_pointer_up(self, pos: Tuple[int, int], buttons: List[Button]) -> None:
+
         if not self.pointer_down:
             return
         self.pointer_down = False
@@ -1279,6 +1349,10 @@ class PhotoFrameApp:
             if self.caption_mode == "fade":
                 self.mark_caption_trigger()
             self.show_overlay()
+            return
+        # If finger moved meaningfully, do not treat as a button tap
+        if self.moved:
+            self.overlay_last_interaction = now_monotonic()
             return
 
         # If overlay is visible, check buttons
@@ -1507,7 +1581,11 @@ class PhotoFrameApp:
 
         clock = pygame.time.Clock()
         TARGET_FPS = 20  # good for Pi 1; try 20–30
-        buttons, _ = make_buttons(*self.screen.get_size(), self.cfg)
+        sw, sh = self.screen.get_size()
+        overlay_h = self.cfg.button_height + self.cfg.ui_padding * 2
+        y = sh - overlay_h + self.cfg.ui_padding
+
+        buttons = make_buttons(sw, sh, self.cfg)
 
 
         # Compute once using worst-case labels so dynamic labels never overflow
@@ -1529,12 +1607,17 @@ class PhotoFrameApp:
             self.maybe_auto_sleep()
             self.maybe_auto_advance()
             self.hide_overlay_if_timed_out()
+            pygame.event.pump()
 
             # Events
             for event in pygame.event.get():
+                #print("EVENT:", pygame.event.event_name(event.type))
+
+                #if os.name == "nt" and event.type == pygame.MOUSEBUTTONDOWN:
+                    #print("CLICK:", event.pos)
+
                 if event.type == pygame.QUIT:
                     self.running = False
-
                 elif event.type == pygame.KEYDOWN:
                     # Useful while developing on PC
                     if event.key == pygame.K_ESCAPE:
@@ -1568,15 +1651,22 @@ class PhotoFrameApp:
                         # toggle shuffle
                         self.action_toggle_shuffle()
                         self.show_overlay()
-
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    self.handle_pointer_down(event.pos)
-
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    #print("DOWN event:", event.pos, "sleeping:", self.sleeping, "overlay_visible:", self.overlay_visible)
+                    p = self.map_pointer_pos(event.pos)
+                    self.handle_pointer_down(p)
                 elif event.type == pygame.MOUSEMOTION:
-                    self.handle_pointer_motion(event.pos)
+                    left_down = bool(getattr(event, "buttons", (0,0,0))[0]) or pygame.mouse.get_pressed(3)[0]
+                    if left_down:
+                        p = self.map_pointer_pos(event.pos)
+                        rel = getattr(event, "rel", (0, 0))
+                        self.handle_pointer_motion(p, rel)
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    #print("UP event button:", getattr(event, "button", None))
+                    p = self.map_pointer_pos(event.pos)
+                    self.handle_pointer_up(p, buttons)
 
-                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                    self.handle_pointer_up(event.pos, buttons)
+
 
             # Render
             self.draw_frame()
@@ -1584,7 +1674,7 @@ class PhotoFrameApp:
             if self.overlay_visible and not self.sleeping:
                 # recreate buttons if resolution changed (rare)
                 if buttons and (buttons[0].rect.bottom > self.screen.get_height() or buttons[0].rect.right > self.screen.get_width()):
-                    buttons, _ = make_buttons(*self.screen.get_size(), self.cfg)
+                    buttons = make_buttons(sw, sh, self.cfg)
                 self.draw_overlay(buttons)
 
             pygame.display.flip()
@@ -1606,6 +1696,9 @@ def main() -> None:
         default_photos = "/mnt/photo-frame/photos"
         default_data = os.path.join(home, "photo-frame-data")
 
+    fullscreen = not args.windowed
+    if os.name == "nt":
+        fullscreen = False   # dev: always windowed on Windows
 
     photos_dir = (
         args.photos
@@ -1623,10 +1716,11 @@ def main() -> None:
     cfg = Config(
         photos_dir=photos_dir,
         data_dir=data_dir,
-        fullscreen=not args.windowed,
+        fullscreen=fullscreen,
         slide_seconds=args.seconds,
         rescan_interval_sec=args.rescan,
     )
+    #print("WINDOWED ARG:", args.windowed, "CFG FULLSCREEN:", cfg.fullscreen, "OS:", os.name)
 
     app = PhotoFrameApp(cfg)
     app.run()
