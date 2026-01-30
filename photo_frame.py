@@ -68,7 +68,7 @@ class Config:
     caption_bg_pad_x: int = 22
     caption_bg_pad_y: int = 14
     interval_steps: tuple[float, ...] = (2.0, 3.0, 5.0, 8.0, 10.0)
-
+    button_font_size: int = 28
     use_text_outline: bool = False   # set True later if you want outlines back
     # Captions behavior
     caption_mode_default: str = "fade"  # "off" | "on" | "fade"
@@ -725,53 +725,49 @@ def blit_centered_scaled(screen: pygame.Surface, img: pygame.Surface) -> None:
 class PhotoFrameApp:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+
+        # Font config globals (used by load_font())
         AppFonts.font_file = self.cfg.font_file
         AppFonts.font_fallback_name = self.cfg.font_fallback_name
+
+        # Paths
         self.photos_dir = os.path.abspath(cfg.photos_dir)
         self.data_dir = os.path.abspath(cfg.data_dir)
-        self.button_font_size = None
         os.makedirs(self.data_dir, exist_ok=True)
 
         self.state_path = os.path.join(self.data_dir, STATE_FILE_NAME)
         self.favorites_dir = os.path.join(self.data_dir, FAVORITES_DIR_NAME)
         os.makedirs(self.favorites_dir, exist_ok=True)
-        self.caption_cache = {}  # path -> (sidecar_text_or_none, folder_name)
 
+        # Expose paths for helpers (if you rely on these elsewhere)
         AppPaths.data_dir = self.data_dir
         AppPaths.font_file = self.cfg.font_file
         AppPaths.font_fallback_name = self.cfg.font_fallback_name
+
+        # Captions metadata cache (sidecar + folder name)
+        self.caption_cache: dict[str, tuple[str | None, str]] = {}
 
         # Runtime state
         self.running = True
         self.sleeping = False
         self.paused = False
+
         self.overlay_visible = False
         self.overlay_last_interaction = 0.0
+
         self.caption_mode = self.cfg.caption_mode_default  # "off" | "on" | "fade"
         self.image_shown_t = now_monotonic()
-        self.last_drawn_path = None
+        self.last_drawn_path: str | None = None
 
+        # Touch / gesture tracking
         self.touch_start = None
-        self.touch_start_time = 0
-
+        self.touch_start_time = 0.0
         self.last_touch_t = now_monotonic()
 
-        #caching
-        self._cached_img_path = None
-        self._cached_img_surf = None
-        self._cached_img_rect = None
-
-        # --- Caption render cache (performance) ---
-        self._cap_cache_path: str | None = None
-        self._cap_cache_max_w: int | None = None
-        self._cap_cache_overlay_h: int | None = None
-
-        self._cap_cache_surfs: list[pygame.Surface] = []
-        self._cap_cache_heights: list[int] = []
-
-        # --- Indicator cache ---
-        self._indicator_last_text: str | None = None
-        self._indicator_surf: pygame.Surface | None = None
+        self.pointer_down = False
+        self.down_pos = (0, 0)
+        self.down_time = 0.0
+        self.moved = False
 
         # Slide timing
         self.last_advance_t = now_monotonic()
@@ -781,7 +777,26 @@ class PhotoFrameApp:
         self.files_sig = (0, 0)
         self.last_rescan_t = 0.0
 
-                # --- Overlay bar cache ---
+        # Image cache (display-ready surfaces)
+        self.cache = ImageCache()
+
+        # Legacy cached image vars (keep if referenced elsewhere)
+        self._cached_img_path = None
+        self._cached_img_surf = None
+        self._cached_img_rect = None
+
+        # --- Caption render cache (performance) ---
+        self._cap_cache_path: str | None = None
+        self._cap_cache_max_w: int | None = None
+        self._cap_cache_overlay_h: int | None = None
+        self._cap_cache_surfs: list[pygame.Surface] = []
+        self._cap_cache_heights: list[int] = []
+
+        # --- Indicator cache ---
+        self._indicator_last_text: str | None = None
+        self._indicator_surf: pygame.Surface | None = None
+
+        # --- Overlay bar cache ---
         self._overlay_bar_surf: pygame.Surface | None = None
         self._overlay_bar_size: tuple[int, int] | None = None
 
@@ -789,29 +804,23 @@ class PhotoFrameApp:
         self._button_label_cache: dict[str, pygame.Surface] = {}
         self._button_label_font_size: int | None = None
 
-
-        # Input gesture tracking
-        self.pointer_down = False
-        self.down_pos = (0, 0)
-        self.down_time = 0.0
-        self.moved = False
-
-        # Display / fonts
+        # Fonts (created in init_pygame AFTER pygame.font.init())
+        self.button_font_size = self.cfg.button_font_size  # or whatever you use
         self.screen: Optional[pygame.Surface] = None
         self.font: Optional[pygame.font.Font] = None
         self.font_small: Optional[pygame.font.Font] = None
+        self.button_font: Optional[pygame.font.Font] = None
 
         # Brightness
         self.user_brightness = float(self.cfg.brightness_default)
         self._last_effective_brightness = None  # cache to avoid reapplying constantly
-        #self._xrandr_output = None              # for Pi/X11 hardware brightness (optional)
 
-        # Order manager & image cache
+        # Order manager
         self.order: Optional[OrderManager] = None
-        self.cache = ImageCache()
 
         # Load persisted state (best effort)
         self.persisted = load_state(self.state_path)
+
 
     def init_pygame(self) -> None:
         if os.name == "nt":
@@ -858,6 +867,7 @@ class PhotoFrameApp:
 
         self.font = load_font(28)
         self.font_small = load_font(20)
+        self.button_font = load_font(self.button_font_size)
         pygame.mouse.set_visible(os.name == "nt")
 
     def map_pointer_pos(self, pos: tuple[int, int]) -> tuple[int, int]:
@@ -923,18 +933,19 @@ class PhotoFrameApp:
         self._cap_cache_heights = [s.get_height() for s in lines]
 
     def _get_button_text_surface(self, label: str) -> pygame.Surface:
-        # If font size changes, clear cache
+        # If font size changes, rebuild font and clear cache
         if self._button_label_font_size != self.button_font_size:
             self._button_label_cache.clear()
             self._button_label_font_size = self.button_font_size
+            self.button_font = load_font(self.button_font_size)
+
+        assert self.button_font is not None
 
         surf = self._button_label_cache.get(label)
         if surf is not None:
             return surf
 
-        font = load_font(self.button_font_size)
-        # Keep it alpha-safe; pygame font surfaces are fine
-        surf = font.render(label, True, (255, 255, 255))
+        surf = self.button_font.render(label, True, (255, 255, 255))
         self._button_label_cache[label] = surf
         return surf
 
